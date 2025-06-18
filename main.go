@@ -29,9 +29,10 @@ const (
 
 // --- MQTT 主题 (Topics) ---
 const (
-	topicAudioStream   = "robot/audio/stream/+"
-	topicControlPrefix = "robot/control/"
-	topicResultPrefix  = "robot/result/"
+	topicAudioStream         = "robot/audio/stream/+"
+	topicControlPrefix       = "robot/control/"
+	topicResultPrefix        = "robot/result/"
+	topicAudioResponsePrefix = "robot/audio/response/"
 )
 
 // -- run-task 指令的数据结构 --
@@ -153,7 +154,6 @@ func onMessageReceived(client mqtt.Client, msg mqtt.Message) {
 const asrTurnTimeout = 2 * time.Second // 在最后一句话结束后，如果2秒没新话，就结束这一轮
 
 // 1. ★★★★★★★★★★★★★★★★★ 用下面的代码，完整替换你现有的 sessionWorker 函数 ★★★★★★★★★★★★★★★★
-
 func sessionWorker(s *SessionState) {
 	sessionID := s.SessionID
 	logf(sessionID, "Worker started for turn.")
@@ -181,20 +181,17 @@ func sessionWorker(s *SessionState) {
 	asrWg.Add(1)
 
 	doneChan := make(chan struct{})
-	var closeOnce sync.Once // 这就是我们的“门卫”，确保门只被关一次
+	var closeOnce sync.Once
 
-	// ASR 结果接收器 - 现在它完全基于云服务的语义断句信号
 	go func() {
 		defer asrWg.Done()
 
 		turnTimer := time.NewTimer(asrTurnTimeout * 2)
 		defer turnTimer.Stop()
 
-		// 这个goroutine专门负责VAD超时
 		go func() {
 			<-turnTimer.C
 			logf(sessionID, "ASR turn ended (no new speech for %v).", asrTurnTimeout)
-			// 安全地关门
 			closeOnce.Do(func() { close(doneChan) })
 		}()
 
@@ -241,7 +238,6 @@ func sessionWorker(s *SessionState) {
 
 			case "task-finished", "task-failed":
 				logf(sessionID, "ASR task ended (event: %s, msg: %s)", resp.Header.Event, resp.Header.ErrorMessage)
-				// 安全地关门
 				closeOnce.Do(func() { close(doneChan) })
 				return
 			}
@@ -340,8 +336,56 @@ mainLoop:
 		defer llmResp.Body.Close()
 		var pyResp ChatResponse
 		if llmResp.StatusCode == http.StatusOK && json.NewDecoder(llmResp.Body).Decode(&pyResp) == nil {
-			logf(sessionID, "LLM response received: '%s'. Publishing to result topic.", pyResp.AIResponse)
-			mqttClient.Publish(topicResultPrefix+sessionID, 0, false, []byte(pyResp.AIResponse))
+			llmText := pyResp.AIResponse
+			logf(sessionID, "LLM response received: '%s'.", llmText)
+
+			logf(sessionID, "Publishing text result to debug topic...")
+			mqttClient.Publish(topicResultPrefix+sessionID, 0, false, []byte(llmText))
+
+			logf(sessionID, "Calling TTS service to generate audio...")
+			audioDataMono, err := textToSpeech(llmText) // ★★★ 1. 变量重命名，明确这是单声道数据 ★★★
+			if err != nil {
+				logf(sessionID, "ERROR: TTS service failed: %v", err)
+			} else {
+				// ★★★ 2. 插入 Mono-to-Stereo 转换核心逻辑 ★★★
+				logf(sessionID, "Converting mono TTS audio (%d bytes) to stereo format for the MCU.", len(audioDataMono))
+				numSamples := len(audioDataMono) / 2
+				audioDataStereo := make([]byte, numSamples*4)
+				for i := 0; i < numSamples; i++ {
+					sample := audioDataMono[i*2 : i*2+2]
+					// 将单声道采样点复制到左右两个声道
+					copy(audioDataStereo[i*4:i*4+2], sample)   // Left channel
+					copy(audioDataStereo[i*4+2:i*4+4], sample) // Right channel
+				}
+				logf(sessionID, "Conversion complete. Stereo audio size: %d bytes.", len(audioDataStereo))
+
+				logf(sessionID, "Commanding client to prepare for playback...")
+				mqttClient.Publish(topicControlPrefix+sessionID, 0, false, "{\"action\":\"prepare_to_play\"}")
+				time.Sleep(100 * time.Millisecond)
+
+				logf(sessionID, "Publishing audio chunks...")
+				const audioChunkSize = 4096
+				audioData := audioDataStereo // ★★★ 3. 使用转换后的双声道数据进行发送 ★★★
+				for i := 0; i < len(audioData); i += audioChunkSize {
+					end := i + audioChunkSize
+					if end > len(audioData) {
+						end = len(audioData)
+					}
+					chunk := audioData[i:end]
+					mqttClient.Publish(topicAudioResponsePrefix+sessionID, 0, false, chunk)
+
+					// ★★★ 4. 修正并解释流控延时计算 ★★★
+					// 我们的I2S引擎采样率是16000Hz, 每个采样点是双声道16-bit, 即4字节。
+					// 所以每秒消耗的字节数是 16000 * 4 = 64000 字节。
+					// 播放一个 chunk 需要的时间(秒) = len(chunk) / 64000
+					// 换算成毫秒 = (len(chunk) * 1000) / 64000
+					sleepMillis := (len(chunk) * 1000) / (16000 * 4)
+					time.Sleep(time.Duration(sleepMillis) * time.Millisecond)
+				}
+
+				logf(sessionID, "All audio chunks sent. Commanding client to resume recording...")
+				mqttClient.Publish(topicControlPrefix+sessionID, 0, false, "{\"action\":\"play_finished_go_ahead\"}")
+			}
 		} else {
 			bodyBytes, _ := io.ReadAll(llmResp.Body)
 			logf(sessionID, "ERROR: LLM returned non-200 status (%d) or bad JSON. Body: %s", llmResp.StatusCode, string(bodyBytes))
